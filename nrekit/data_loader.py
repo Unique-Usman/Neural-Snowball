@@ -345,7 +345,7 @@ class JSONFileDataLoader(FileDataLoader):
         return: a dataset
         '''
         
-        target_classes = random.sample(self.rel2scope.keys(), num_class) 
+        target_classes = random.sample(list(self.rel2scope.keys()), num_class) 
         if not pos_class in target_classes:
             target_classes = target_classes[:-1] + [pos_class]
         candidate = {'word': [], 'pos1': [], 'pos2': [], 'mask': [], 'id': [], 'entpair': []}
@@ -389,7 +389,7 @@ class JSONFileDataLoader(FileDataLoader):
         query_class: num of classes in query set
         return: support_pos, support_neg, query, name_of_pos_class
         '''
-        target_classes = random.sample(self.rel2scope.keys(), query_class) # 0 class is the new relation 
+        target_classes = random.sample(list(self.rel2scope.keys()), query_class) # 0 class is the new relation 
         support_pos = {'word': [], 'pos1': [], 'pos2': [], 'mask': [], 'id': [], 'entpair': []}
         support_neg = {'word': [], 'pos1': [], 'pos2': [], 'mask': [], 'id': [], 'entpair': []}
         query = {'word': [], 'pos1': [], 'pos2': [], 'mask': [], 'id': [], 'label': []}
@@ -685,7 +685,7 @@ class JSONFileDataLoader(FileDataLoader):
 
     def sample_for_eval(self, train_data_loader, support_pos_size, query_size, target_class=None, query_train=True, query_val=True): 
         if target_class is None:
-            target_class = random.sample(self.rel2scope.keys(), 1)[0] 
+            target_class = random.sample(list(self.rel2scope.keys()), 1)[0] 
         support_pos = {'word': [], 'pos1': [], 'pos2': [], 'mask': [], 'id': [], 'entpair': []}
         query = {'word': [], 'pos1': [], 'pos2': [], 'mask': [], 'id': [], 'label': []}
 
@@ -773,7 +773,7 @@ class JSONFileDataLoader(FileDataLoader):
         num_size: The num of instances for ONE class. The total size is num_size * num_classes.
         num_class: The num of classes (include the positive class).
         '''
-        target_classes = random.sample(self.rel2scope.keys(), num_class)
+        target_classes = random.sample(list(self.rel2scope.keys()), num_class)
         batch = {'word': [], 'pos1': [], 'pos2': [], 'mask': []}
 
         for i, class_name in enumerate(target_classes):

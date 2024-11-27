@@ -288,7 +288,8 @@ class JSONFileDataLoaderBERT(FileDataLoader):
         num_size: The num of instances for ONE class. The total size is num_size * num_classes.
         num_class: The num of classes (include the positive class).
         '''
-        target_classes = random.sample(self.rel2scope.keys(), num_class)
+        # target_classes = random.sample(self.rel2scope.keys(), num_class)
+        target_classes = random.sample(list(self.rel2scope.keys()), num_class)
         batch = {'word': [], 'mask': []}
 
         for i, class_name in enumerate(target_classes):

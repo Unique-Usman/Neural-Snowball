@@ -39,7 +39,7 @@ class BERTSentenceEncoder(nn.Module):
 
     def __init__(self, pretrain_path): 
         nn.Module.__init__(self)
-        self.bert = BertModel.from_pretrained(pretrain_path)
+        self.bert = BertModel.from_pretrained(pretrain_path, return_dict=False)
 
     def forward(self, inputs):
         _, x = self.bert(inputs['word'], attention_mask=inputs['mask'])
