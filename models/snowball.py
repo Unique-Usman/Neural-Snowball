@@ -10,6 +10,46 @@ from torch.nn import functional as F
 import sklearn.metrics 
 import copy
 
+class DynamicThreshold:
+    def __init__(self, alpha=0.5, beta=3, decay_rate=0.9):
+        """
+        Initialize dynamic threshold parameters.
+        Args:
+            alpha (float): Initial confidence threshold.
+            beta (int): Initial number of iterations for instance selection.
+            decay_rate (float): Decay factor for thresholds.
+        """
+        self.alpha = alpha
+        self.beta = beta
+        self.decay_rate = decay_rate
+        self.confidence_history = []
+
+    def adjust_thresholds(self, avg_confidence, low_threshold=0.4, high_threshold=0.7, step=1):
+        """
+        Adjust alpha and beta based on average confidence.
+        """
+        if avg_confidence < low_threshold:
+            self.beta += step  # Increase exploration
+        elif avg_confidence > high_threshold:
+            self.beta = max(self.beta - step, 1)  # Reduce unnecessary iterations
+        self.alpha = avg_confidence  # Update alpha to match current confidence
+
+    def decay_thresholds(self):
+        """
+        Apply decay to thresholds.
+        """
+        self.alpha *= self.decay_rate
+        self.beta = max(1, int(self.beta * self.decay_rate))
+
+    def check_early_stopping(self, window_size=5, variance_threshold=0.001):
+        """
+        Check if confidence scores have stabilized for early stopping.
+        """
+        if len(self.confidence_history) < window_size:
+            return False
+        recent_scores = self.confidence_history[-window_size:]
+        return np.var(recent_scores) < variance_threshold
+    
 class Siamese(nn.Module):
 
     def __init__(self, sentence_encoder, hidden_size=230, drop_rate=0.5, pre_rep=None, euc=True):
@@ -148,6 +188,8 @@ class Snowball(nrekit.framework.Model):
 
         self.pre_rep = pre_rep
         self.neg_loader = neg_loader
+        self.dynamic_threshold = DynamicThreshold()  # Instantiate DynamicThreshold
+
 
     # def __loss__(self, logits, label):
     #     onehot_label = torch.zeros(logits.size()).cuda()
@@ -467,6 +509,8 @@ class Snowball(nrekit.framework.Model):
         for snowball_iter in range(snowball_max_iter):
             if self.args.print_debug:
                 print('###### snowball iter ' + str(snowball_iter))
+            
+            self.dynamic_threshold.decay_thresholds()
             # phase 1: expand positive support set from distant dataset (with same entity pairs)
 
             ## get all entpairs and their ins in positive support set
@@ -510,6 +554,20 @@ class Snowball(nrekit.framework.Model):
       
                 # -- method B: use sort --
                 for i in range(min(len(pick_or_not), sort_num1)):
+                    # Calculate average confidence for this batch
+                    avg_confidence = torch.mean(torch.tensor([x[0] for x in pick_or_not[:sort_num1]])).item()
+                    self.dynamic_threshold.adjust_thresholds(avg_confidence)
+                    dynamic_threshold = self.dynamic_threshold.alpha
+
+                    # Add the average confidence to the history for early stopping
+                    self.dynamic_threshold.confidence_history.append(avg_confidence)
+
+                    # Check for early stopping
+                    if self.dynamic_threshold.check_early_stopping(window_size=5, variance_threshold=0.001):
+                        print("Early stopping triggered.")
+                        break  # Exit the training loop if early stopping condition is met
+
+
                     if pick_or_not[i][0] > sort_threshold1:
                         iid = pick_or_not[i][1]
                         self._add_ins_to_vdata(support_pos, entpair_distant[entpair], iid, label=1)
