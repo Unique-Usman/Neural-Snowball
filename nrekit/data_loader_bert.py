@@ -320,7 +320,7 @@ class JSONFileDataLoaderBERT(FileDataLoader):
         return: a dataset
         '''
         
-        target_classes = random.sample(self.rel2scope.keys(), num_class) 
+        target_classes = random.sample(list(self.rel2scope.keys()), num_class) 
         if not pos_class in target_classes:
             target_classes = target_classes[:-1] + [pos_class]
         candidate = {'word': [], 'mask': [], 'id': [], 'entpair': []}
@@ -358,7 +358,7 @@ class JSONFileDataLoaderBERT(FileDataLoader):
         query_class: num of classes in query set
         return: support_pos, support_neg, query, name_of_pos_class
         '''
-        target_classes = random.sample(self.rel2scope.keys(), query_class) # 0 class is the new relation 
+        target_classes = random.sample(list(self.rel2scope.keys()), query_class) # 0 class is the new relation 
         support_pos = {'word': [], 'mask': [], 'id': [], 'entpair': []}
         support_neg = {'word': [], 'mask': [], 'id': [], 'entpair': []}
         query = {'word': [], 'mask': [], 'id': [], 'label': []}
@@ -528,7 +528,7 @@ class JSONFileDataLoaderBERT(FileDataLoader):
         return support_pos, support_neg, query, main_class
 
     def next_fewshot_one(self, N, K, Q):
-        target_classes = random.sample(self.rel2scope.keys(), N)
+        target_classes = random.sample(list(self.rel2scope.keys()), N)
         support_set = {'word': [], 'mask': [], 'id': []}
         query_set = {'word': [], 'mask': [], 'id': []}
         query_label = []
