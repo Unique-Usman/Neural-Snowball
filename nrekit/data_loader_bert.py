@@ -598,7 +598,7 @@ class JSONFileDataLoaderBERT(FileDataLoader):
 
     def sample_for_eval(self, train_data_loader, support_pos_size, query_size, target_class=None, query_train=True, query_val=True): 
         if target_class is None:
-            target_class = random.sample(self.rel2scope.keys(), 1)[0] 
+            target_class = random.sample(list(self.rel2scope.keys()), 1)[0] 
         support_pos = {'word': [], 'mask': [], 'id': [], 'entpair': []}
         query = {'word': [], 'mask': [], 'id': [], 'label': []}
 
