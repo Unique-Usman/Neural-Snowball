@@ -7,49 +7,39 @@ import torch
 from torch import autograd, optim, nn
 from torch.autograd import Variable
 from torch.nn import functional as F
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv, GATConv
 import sklearn.metrics 
 import copy
 
-class DynamicThreshold:
-    def __init__(self, alpha=0.5, beta=3, decay_rate=0.9):
-        """
-        Initialize dynamic threshold parameters.
-        Args:
-            alpha (float): Initial confidence threshold.
-            beta (int): Initial number of iterations for instance selection.
-            decay_rate (float): Decay factor for thresholds.
-        """
-        self.alpha = alpha
-        self.beta = beta
-        self.decay_rate = decay_rate
-        self.confidence_history = []
-
-    def adjust_thresholds(self, avg_confidence, low_threshold=0.4, high_threshold=0.7, step=1):
-        """
-        Adjust alpha and beta based on average confidence.
-        """
-        if avg_confidence < low_threshold:
-            self.beta += step  # Increase exploration
-        elif avg_confidence > high_threshold:
-            self.beta = max(self.beta - step, 1)  # Reduce unnecessary iterations
-        self.alpha = avg_confidence  # Update alpha to match current confidence
-
-    def decay_thresholds(self):
-        """
-        Apply decay to thresholds.
-        """
-        self.alpha *= self.decay_rate
-        self.beta = max(1, int(self.beta * self.decay_rate))
-
-    def check_early_stopping(self, window_size=5, variance_threshold=0.001):
-        """
-        Check if confidence scores have stabilized for early stopping.
-        """
-        if len(self.confidence_history) < window_size:
-            return False
-        recent_scores = self.confidence_history[-window_size:]
-        return np.var(recent_scores) < variance_threshold
+class WeightedGNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, use_attention=True):
+        super(WeightedGNN, self).__init__()
+        self.use_attention = use_attention
+        
+        if use_attention:
+            self.conv1 = GATConv(input_dim, hidden_dim, heads=8, dropout=0.5)
+            self.conv2 = GATConv(hidden_dim * 8, output_dim, heads=1, concat=False, dropout=0.5)
+        else:
+            self.conv1 = GCNConv(input_dim, hidden_dim)
+            self.conv2 = GCNConv(hidden_dim, output_dim)
+        
+        self.dropout = nn.Dropout(0.5)
+        
+    def forward(self, x, edge_index, edge_weight=None):
+        # Normalize edge weights (ADDED)
+        if edge_weight is not None:
+            edge_weight = edge_weight / edge_weight.sum()  # Normalize
+        
+        if self.use_attention:
+            x = F.elu(self.conv1(x, edge_index))
+        else:
+            x = F.relu(self.conv1(x, edge_index, edge_weight))
+        x = self.dropout(x)
+        x = self.conv2(x, edge_index, edge_weight)
+        return x
     
+
 class Siamese(nn.Module):
 
     def __init__(self, sentence_encoder, hidden_size=230, drop_rate=0.5, pre_rep=None, euc=True):
@@ -176,11 +166,11 @@ class Snowball(nrekit.framework.Model):
         nrekit.framework.Model.__init__(self, sentence_encoder)
         self.hidden_size = hidden_size
         self.base_class = base_class
-        self.fc = nn.Linear(hidden_size, base_class)
-        self.drop = nn.Dropout(drop_rate)
+        #self.fc = nn.Linear(hidden_size, base_class)
+        #self.drop = nn.Dropout(drop_rate)
         self.siamese_model = siamese_model
         # self.cost = nn.BCEWithLogitsLoss()
-        self.cost = nn.BCELoss(reduction="none")
+        #self.cost = nn.BCELoss(reduction="none")
         # self.cost = nn.CrossEntropyLoss()
         self.weight_table = weight_table
         
@@ -188,8 +178,55 @@ class Snowball(nrekit.framework.Model):
 
         self.pre_rep = pre_rep
         self.neg_loader = neg_loader
-        self.dynamic_threshold = DynamicThreshold()  # Instantiate DynamicThreshold
 
+
+        #added for GNN ###########################################
+        self.sentence_encoder = sentence_encoder
+        self.hidden_size = hidden_size
+        self.args = args
+        
+        # Initialize GNN
+        self.gnn = WeightedGNN(
+            input_dim=hidden_size,
+            hidden_dim=hidden_size//2,
+            output_dim=hidden_size,
+            use_attention=True
+        )
+
+        # Original Snowball components REPLACING LINES 166/167/169
+        self.fc = nn.Linear(hidden_size * 2, 1)  # *2 because we concatenate RSN and GNN features
+        self.drop = nn.Dropout(drop_rate)
+        self.cost = nn.BCELoss()
+         
+    def _construct_graph(self, support_pos_rep, pick_or_not, batch_size):
+        """
+        Constructs graph from similarity scores
+        Args:
+            support_pos_rep: node features
+            pick_or_not: similarity scores from siamese network
+            batch_size: batch size for processing
+        """
+        num_nodes = support_pos_rep.size(0)
+        edge_index = []
+        edge_weights = []
+        
+        # Convert similarity scores to edge index and weights
+        for score, idx in pick_or_not:
+            if score > 0.5:  # Confidence threshold
+                edge_index.append([idx // batch_size, idx % batch_size])
+                edge_weights.append(score)
+        
+        if len(edge_index) == 0:
+            return None, None
+            
+        edge_index = torch.tensor(edge_index).t().contiguous().cuda()
+        edge_weights = torch.tensor(edge_weights).cuda()
+        
+        return edge_index, edge_weights
+                
+        ##############END##########################################################
+
+        
 
     # def __loss__(self, logits, label):
     #     onehot_label = torch.zeros(logits.size()).cuda()
@@ -315,10 +352,10 @@ class Snowball(nrekit.framework.Model):
         self.new_W = self.new_W.cuda()
         self.new_bias = self.new_bias.cuda()
 
-    def _train_finetune(self, data_repre, learning_rate=None, weight_decay=1e-5):
+    def _train_finetune(self, data_repre, learning_rate=None, weight_decay=1e-5, edge_index=None, edge_weights=None, ):
         '''
         train finetune classifier with given data
-        data_repre: sentence representation (encoder's output)
+        data_repre: sentence representation (encoder's output) 
         label: label
         '''
         
@@ -327,6 +364,15 @@ class Snowball(nrekit.framework.Model):
         optimizer = self.optimizer
         if learning_rate is not None:
             optimizer = optim.Adam([self.new_W, self.new_bias], learning_rate, weight_decay=weight_decay)
+
+        # Apply GNN if graph structure exists #######################
+        if edge_index is not None and edge_weights is not None:
+            gnn_enhanced_rep = self.gnn(data_repre, edge_index, edge_weights)
+            # Combine original and GNN-enhanced features
+            enhanced_rep = data_repre + 0.5 * gnn_enhanced_rep
+        else:
+            enhanced_rep = data_repre#####################
+
 
         # hyperparameters
         max_epoch = self.args.finetune_epoch
@@ -345,7 +391,8 @@ class Snowball(nrekit.framework.Model):
             order = list(range(data_repre.size(0)))
             random.shuffle(order)
             for i in range(max_iter):            
-                x = data_repre[order[i * batch_size : min((i + 1) * batch_size, data_repre.size(0))]]
+                x = enhanced_rep[order[i * batch_size : min((i + 1) * batch_size, enhanced_rep.size(0))]]
+    
                 # batch_label = label[order[i * batch_size : min((i + 1) * batch_size, data_repre.size(0))]]
                 
                 # neg sampling
@@ -354,21 +401,29 @@ class Snowball(nrekit.framework.Model):
                 neg_size = int(x.size(0) * 1)
                 neg = self.neg_loader.next_batch(neg_size)
                 neg = self.encode(neg, self.args.infer_batch_size)
-                x = torch.cat([x, neg], 0)
-                batch_label = torch.cat([batch_label, torch.zeros((neg_size)).long().cuda()], 0)
+                ###########REMOVEDx = torch.cat([x, neg], 0)
+                #############batch_label = torch.cat([batch_label, torch.zeros((neg_size)).long().cuda()], 0)
                 # ---------------------
 
-                x = torch.matmul(x, self.new_W) + self.new_bias # (batch_size, 1)
+                ######################### Apply GNN to negative samples if graph exists
+                if edge_index is not None and edge_weights is not None:
+                    neg_enhanced = self.gnn(neg, edge_index, edge_weights)
+                    neg = neg + 0.5 * neg_enhanced
+                
+                x = torch.cat([x, neg], 0)
+                batch_label = torch.cat([batch_label, torch.zeros((neg_size)).long().cuda()], 0)
+
+                x = torch.matmul(x, self.new_W) + self.new_bias
                 x = torch.sigmoid(x)
 
-                # iter_loss = self.__loss__(x, batch_label.float()).mean()
                 weight = torch.ones(batch_label.size(0)).float().cuda()
-                weight[batch_label == 0] = self.args.finetune_weight #1 / float(max_epoch)
+                weight[batch_label == 0] = self.args.finetune_weight
                 iter_loss = (self.__loss__(x, batch_label.float()) * weight).mean()
 
                 optimizer.zero_grad()
                 iter_loss.backward(retain_graph=True)
                 optimizer.step()
+                
                 if self.args.print_debug:
                     sys.stdout.write('[snowball finetune] epoch {0:4} iter {1:4} | loss: {2:2.6f}'.format(epoch, i, iter_loss) + '\r')
                     sys.stdout.flush()
@@ -506,11 +561,13 @@ class Snowball(nrekit.framework.Model):
         exist_id = {}
         if self.args.print_debug:
             print('\n-------------------------------------------------------')
+        
+        
+        
+        
         for snowball_iter in range(snowball_max_iter):
             if self.args.print_debug:
                 print('###### snowball iter ' + str(snowball_iter))
-            
-            self.dynamic_threshold.decay_thresholds()
             # phase 1: expand positive support set from distant dataset (with same entity pairs)
 
             ## get all entpairs and their ins in positive support set
@@ -551,68 +608,24 @@ class Snowball(nrekit.framework.Model):
                 
                 # pick_or_not = self.siamese_model.forward_infer_sort(original_support_pos, entpair_distant[entpair], threshold=threshold_for_phase1)
                 # pick_or_not = self._infer(entpair_distant[entpair]) > threshold
-      
+                
+                #################ADDED FOR GNN
+                # Construct graph from similarity scores
+                edge_index, edge_weights = self._construct_graph(
+                    support_pos_rep,
+                    pick_or_not,
+                    self.args.infer_batch_size
+            )####################################
+
                 # -- method B: use sort --
                 for i in range(min(len(pick_or_not), sort_num1)):
-                    # Calculate average confidence for this batch
-                    avg_confidence = torch.mean(torch.tensor([x[0] for x in pick_or_not[:sort_num1]])).item()
-                    self.dynamic_threshold.adjust_thresholds(avg_confidence)
-                    dynamic_threshold = self.dynamic_threshold.alpha
-
-                    # Add the average confidence to the history for early stopping
-                    self.dynamic_threshold.confidence_history.append(avg_confidence)
-
-                    # Check for early stopping
-                    if self.dynamic_threshold.check_early_stopping(window_size=5, variance_threshold=0.001):
-                        print("Early stopping triggered.")
-                        break  # Exit the training loop if early stopping condition is met
-
-
                     if pick_or_not[i][0] > sort_threshold1:
                         iid = pick_or_not[i][1]
                         self._add_ins_to_vdata(support_pos, entpair_distant[entpair], iid, label=1)
                         exist_id[entpair_distant[entpair]['id'][iid]] = 1
                         self._phase1_add_num += 1
                 self._phase1_total += entpair_distant[entpair]['word'].size(0)
-            '''
-            if 'pos1' in support_pos:
-                candidate = {'word': [], 'pos1': [], 'pos2': [], 'mask': [], 'id': [], 'entpair': []}
-            else:
-                candidate = {'word': [], 'mask': [], 'id': [], 'entpair': []}
-
-            self._phase1_add_num = 0 # total number of snowball instances
-            self._phase1_total = 0
-            for entpair in entpair_support:
-                raw = distant.get_same_entpair_ins(entpair) # ins with the same entpair
-                if raw is None:
-                    continue
-                for i in range(raw['word'].size(0)):
-                    if raw['id'][i] not in exist_id: # don't pick sentences already in the support set
-                        self._add_ins_to_data(candidate, raw, i)
-
-            if len(candidate['word']) > 0:
-                self._dataset_stack_and_cuda(candidate)
-                pick_or_not = self.siamese_model.forward_infer_sort(support_pos, candidate, batch_size=self.args.infer_batch_size)
-                    
-                for i in range(min(len(pick_or_not), sort_num1)):
-                    if pick_or_not[i][0] > sort_threshold1:
-                        iid = pick_or_not[i][1]
-                        self._add_ins_to_vdata(support_pos, candidate, iid, label=1)
-                        exist_id[candidate['id'][iid]] = 1
-                        self._phase1_add_num += 1
-                self._phase1_total += candidate['word'].size(0)
-            '''
-            ## build new support set
             
-            # print('---')
-            # for i in range(len(support_pos['entpair'])):
-            #     print(support_pos['entpair'][i])
-            # print('---')
-            # print('---')
-            # for i in range(support_pos['id'].size(0)):
-            #     print(support_pos['id'][i])
-            # print('---')
-
             support_pos_rep = self.encode(support_pos, batch_size=self.args.infer_batch_size)
             # support_rep = torch.cat([support_pos_rep, support_neg_rep], 0)
             # support_label = torch.cat([support_pos['label'], support_neg['label']], 0)
@@ -620,7 +633,11 @@ class Snowball(nrekit.framework.Model):
             ## finetune
             # print("Fine-tune Init")
             self._train_finetune_init()
-            self._train_finetune(support_pos_rep)
+            #################################ADDED
+            self._train_finetune(support_pos_rep, edge_index, edge_weights)
+            #################################
+
+
             if self.args.eval:
                 self._forward_eval_binary(query, threshold)
             # self._metric.append(np.array([self._f1, self._prec, self._recall]))
@@ -665,7 +682,8 @@ class Snowball(nrekit.framework.Model):
             ## finetune
             # print("Fine-tune Init")
             self._train_finetune_init()
-            self._train_finetune(support_pos_rep)
+            self._train_finetune(support_pos_rep, edge_index, edge_weights)
+    
             if self.args.eval:
                 self._forward_eval_binary(query, threshold)
                 self._metric.append(np.array([self._f1, self._prec, self._recall]))
