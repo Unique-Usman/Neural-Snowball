@@ -1,4 +1,5 @@
 import sys
+from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import random
 sys.path.append('..')
@@ -10,14 +11,18 @@ from torch.nn import functional as F
 import sklearn.metrics 
 import copy
 
-class Siamese(nn.Module):
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+
+class Siamese(nn.Module):
     def __init__(self, sentence_encoder, hidden_size=230, drop_rate=0.5, pre_rep=None, euc=True):
-        nn.Module.__init__(self)
-        self.sentence_encoder = sentence_encoder # Should be different from main sentence encoder
+        super(Siamese, self).__init__()
+        self.sentence_encoder = sentence_encoder
         self.hidden_size = hidden_size
-        # self.fc1 = nn.Linear(hidden_size * 2, hidden_size * 2)
-        # self.fc2 = nn.Linear(hidden_size * 2, 1)
+        self.gnn = GCNConv(hidden_size, hidden_size)  # GNN layer
         self.fc = nn.Linear(hidden_size, 1)
         self.cost = nn.BCELoss(reduction="none")
         self.drop = nn.Dropout(drop_rate)
@@ -27,12 +32,15 @@ class Siamese(nn.Module):
 
     def forward(self, data, num_size, num_class, threshold=0.5):
         x = self.sentence_encoder(data).contiguous().view(num_class, num_size, -1)
-        x1 = x[:, :num_size//2].contiguous().view(-1, self.hidden_size)
-        x2 = x[:, num_size//2:].contiguous().view(-1, self.hidden_size)
-        y1 = x[:num_class//2,:].contiguous().view(-1, self.hidden_size)
-        y2 = x[num_class//2:,:].contiguous().view(-1, self.hidden_size)
-        # y1 = x[0].contiguous().unsqueeze(0).expand(x.size(0) - 1, -1, -1).contiguous().view(-1, self.hidden_size)
-        # y2 = x[1:].contiguous().view(-1, self.hidden_size)
+        x1 = x[:, :num_size // 2].contiguous().view(-1, self.hidden_size)
+        x2 = x[:, num_size // 2:].contiguous().view(-1, self.hidden_size)
+        y1 = x[:num_class // 2, :].contiguous().view(-1, self.hidden_size)
+        y2 = x[num_class // 2:, :].contiguous().view(-1, self.hidden_size)
+
+        # GNN layer for graph-based feature enhancement
+        edge_index = self.construct_graph(x1, k=5)  # Pass node features to construct graph dynamically
+        x1 = self.gnn(x1, edge_index)
+        x2 = self.gnn(x2, edge_index)
 
         label = torch.zeros((x1.size(0) + y1.size(0))).long().cuda()
         label[:x1.size(0)] = 1
@@ -47,9 +55,6 @@ class Siamese(nn.Module):
             z = z1 * z2
             z = self.drop(z)
             z = self.fc(z).squeeze()
-            # z = torch.cat([z1, z2], -1)
-            # z = F.relu(self.fc1(z))
-            # z = self.fc2(z).squeeze()
             score = torch.sigmoid(z)
 
         self._loss = self.cost(score, label.float()).mean()
@@ -60,6 +65,40 @@ class Siamese(nn.Module):
         label = label.cpu().detach().numpy()
         self._prec = float(np.logical_and(pred == 1, label == 1).sum()) / float((pred == 1).sum() + 1)
         self._recall = float(np.logical_and(pred == 1, label == 1).sum()) / float((label == 1).sum() + 1)
+
+
+    def construct_graph(self, node_features, k=5):
+        """
+        Construct a graph based on cosine similarity or other criteria.
+        
+        Args:
+            node_features (torch.Tensor): Node features (num_nodes x hidden_size).
+            k (int): Number of nearest neighbors to connect each node to.
+            
+        Returns:
+            torch.Tensor: Edge index (2 x num_edges).
+        """
+        # Convert node features to numpy for similarity computation
+        features = node_features.cpu().detach().numpy()
+        
+        # Compute pairwise cosine similarity
+        similarity_matrix = cosine_similarity(features)
+        
+        # For each node, find the top-k similar nodes (excluding itself)
+        num_nodes = similarity_matrix.shape[0]
+        edge_index = []
+        
+        for i in range(num_nodes):
+            # Get indices of the k largest similarities (excluding self-loops)
+            neighbors = np.argsort(similarity_matrix[i])[-(k + 1):-1]
+            for neighbor in neighbors:
+                edge_index.append((i, neighbor))
+                edge_index.append((neighbor, i))  # Add reverse edge for undirected graph
+
+        # Convert edge index to tensor
+        edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+        return edge_index.cuda()
+
 
     def encode(self, dataset, batch_size=0): 
         self.sentence_encoder.eval()
