@@ -166,51 +166,26 @@ class Snowball(nrekit.framework.Model):
         nrekit.framework.Model.__init__(self, sentence_encoder)
         self.hidden_size = hidden_size
         self.base_class = base_class
-        #self.fc = nn.Linear(hidden_size, base_class)
-        #self.drop = nn.Dropout(drop_rate)
         self.siamese_model = siamese_model
-        # self.cost = nn.BCEWithLogitsLoss()
-        #self.cost = nn.BCELoss(reduction="none")
-        # self.cost = nn.CrossEntropyLoss()
         self.weight_table = weight_table
-        
         self.args = args
-
         self.pre_rep = pre_rep
         self.neg_loader = neg_loader
 
-
-        #added for GNN ###########################################
-        self.sentence_encoder = sentence_encoder
-        self.hidden_size = hidden_size
-        self.args = args
-        
         # Initialize GNN
-        self.gnn = WeightedGNN(
-            input_dim=hidden_size,
-            hidden_dim=hidden_size//2,
-            output_dim=hidden_size,
-            use_attention=True
-        )
-
-        # Original Snowball components REPLACING LINES 166/167/169
-        self.fc = nn.Linear(hidden_size * 2, 1)  # *2 because we concatenate RSN and GNN features
+        self.gnn = WeightedGNN(input_dim=hidden_size, hidden_dim=hidden_size//2, output_dim=hidden_size)
+        
+        # Modified for combined RSN and GNN features
+        self.fc = nn.Linear(hidden_size, base_class)  # Changed from hidden_size*2 to hidden_size
         self.drop = nn.Dropout(drop_rate)
-        self.cost = nn.BCELoss()
+        self.cost = nn.BCELoss(reduction="none")
          
     def _construct_graph(self, support_pos_rep, pick_or_not, batch_size):
-        """
-        Constructs graph from similarity scores
-        Args:
-            support_pos_rep: node features
-            pick_or_not: similarity scores from siamese network
-            batch_size: batch size for processing
-        """
+        """Constructs graph from similarity scores"""
         num_nodes = support_pos_rep.size(0)
         edge_index = []
         edge_weights = []
         
-        # Convert similarity scores to edge index and weights
         for score, idx in pick_or_not:
             if score > 0.5:  # Confidence threshold
                 edge_index.append([idx // batch_size, idx % batch_size])
@@ -248,10 +223,9 @@ class Snowball(nrekit.framework.Model):
         else:
             weight = self.weight_table[data['label']].unsqueeze(1).expand(-1, self.base_class).contiguous().view(-1)
         label = torch.zeros((batch_size, self.base_class)).cuda()
-        label.scatter_(1, data['label'].view(-1, 1), 1) # (batch_size, base_class)
+        label.scatter_(1, data['label'].view(-1, 1), 1)
         loss_array = self.__loss__(x, label)
         self._loss = ((label.view(-1) + 1.0 / self.base_class) * weight * loss_array).mean() * self.base_class
-        # self._loss = self.__loss__(x, data['label'])
         
         _, pred = x.max(-1)
         self._accuracy = self.__accuracy__(pred, data['label'])
@@ -352,70 +326,60 @@ class Snowball(nrekit.framework.Model):
         self.new_W = self.new_W.cuda()
         self.new_bias = self.new_bias.cuda()
 
-    def _train_finetune(self, data_repre, learning_rate=None, weight_decay=1e-5, edge_index=None, edge_weights=None, ):
+    def _train_finetune(self, data_repre, edge_index=None, edge_weights=None, learning_rate=None, weight_decay=1e-5):
         '''
         train finetune classifier with given data
         data_repre: sentence representation (encoder's output) 
-        label: label
+        edge_index: graph connectivity
+        edge_weights: edge weights from similarity scores
         '''
-        
         self.train()
 
         optimizer = self.optimizer
         if learning_rate is not None:
             optimizer = optim.Adam([self.new_W, self.new_bias], learning_rate, weight_decay=weight_decay)
 
-        # Apply GNN if graph structure exists #######################
+        # Apply GNN if graph structure exists
         if edge_index is not None and edge_weights is not None:
-            gnn_enhanced_rep = self.gnn(data_repre, edge_index, edge_weights)
-            # Combine original and GNN-enhanced features
-            enhanced_rep = data_repre + 0.5 * gnn_enhanced_rep
+            gnn_features = self.gnn(data_repre, edge_index, edge_weights)
+            # Combine original and GNN features through addition
+            enhanced_rep = data_repre + gnn_features
         else:
-            enhanced_rep = data_repre#####################
+            enhanced_rep = data_repre
 
-
-        # hyperparameters
+        # Hyperparameters
         max_epoch = self.args.finetune_epoch
         batch_size = self.args.finetune_batch_size
         
-        # dropout
-        data_repre = self.drop(data_repre) 
-        
-        # train
-        if self.args.print_debug:
-            print('')
         for epoch in range(max_epoch):
-            max_iter = data_repre.size(0) // batch_size
-            if data_repre.size(0) % batch_size != 0:
+            max_iter = enhanced_rep.size(0) // batch_size
+            if enhanced_rep.size(0) % batch_size != 0:
                 max_iter += 1
-            order = list(range(data_repre.size(0)))
+            order = list(range(enhanced_rep.size(0)))
             random.shuffle(order)
-            for i in range(max_iter):            
+            
+            for i in range(max_iter):
                 x = enhanced_rep[order[i * batch_size : min((i + 1) * batch_size, enhanced_rep.size(0))]]
-    
-                # batch_label = label[order[i * batch_size : min((i + 1) * batch_size, data_repre.size(0))]]
                 
-                # neg sampling
-                # ---------------------
+                # Negative sampling
                 batch_label = torch.ones((x.size(0))).long().cuda()
                 neg_size = int(x.size(0) * 1)
                 neg = self.neg_loader.next_batch(neg_size)
                 neg = self.encode(neg, self.args.infer_batch_size)
-                ###########REMOVEDx = torch.cat([x, neg], 0)
-                #############batch_label = torch.cat([batch_label, torch.zeros((neg_size)).long().cuda()], 0)
-                # ---------------------
-
-                ######################### Apply GNN to negative samples if graph exists
-                if edge_index is not None and edge_weights is not None:
-                    neg_enhanced = self.gnn(neg, edge_index, edge_weights)
-                    neg = neg + 0.5 * neg_enhanced
                 
+                print("Shape of x after sentence encoder:", x.shape)
+
+                # Apply GNN to negative samples if graph exists
+                if edge_index is not None and edge_weights is not None:
+                    neg_gnn = self.gnn(neg, edge_index, edge_weights)
+                    neg = neg + neg_gnn
+
                 x = torch.cat([x, neg], 0)
                 batch_label = torch.cat([batch_label, torch.zeros((neg_size)).long().cuda()], 0)
 
                 x = torch.matmul(x, self.new_W) + self.new_bias
                 x = torch.sigmoid(x)
-
+                
                 weight = torch.ones(batch_label.size(0)).float().cuda()
                 weight[batch_label == 0] = self.args.finetune_weight
                 iter_loss = (self.__loss__(x, batch_label.float()) * weight).mean()
@@ -427,6 +391,7 @@ class Snowball(nrekit.framework.Model):
                 if self.args.print_debug:
                     sys.stdout.write('[snowball finetune] epoch {0:4} iter {1:4} | loss: {2:2.6f}'.format(epoch, i, iter_loss) + '\r')
                     sys.stdout.flush()
+        
         self.eval()
 
     def _add_ins_to_data(self, dataset_dst, dataset_src, ins_id, label=None):
