@@ -7,6 +7,7 @@ import torch
 from torch import autograd, optim, nn
 from torch.autograd import Variable
 from torch.nn import functional as F
+import matplotlib.pyplot as plt  # Add this import
 
 import sklearn.metrics 
 import copy
@@ -208,6 +209,11 @@ class Snowball(nrekit.framework.Model):
         self.neg_loader = neg_loader
         self.topk_manager = TopKSentenceManager(k=5)  # Add this line
 
+        # Initialize lists to store metrics
+        self.similarity_scores = []  # Store similarity scores
+        self.accuracy_history = []    # Store accuracy history
+
+
     # def __loss__(self, logits, label):
     #     onehot_label = torch.zeros(logits.size()).cuda()
     #     onehot_label.scatter_(1, label.view(-1, 1), 1)
@@ -296,7 +302,30 @@ class Snowball(nrekit.framework.Model):
         self._accuracy = self.__accuracy__(pred.view(-1), label.view(-1))
 
         return logits, pred
-
+    def plot_metrics(self):
+        plt.figure(figsize=(12, 5))
+        
+        # Plot similarity scores
+        plt.subplot(1, 2, 1)
+        if self.similarity_scores:
+            plt.plot(self.similarity_scores, label='Similarity')
+            plt.axhline(y=0.5, color='r', linestyle='--', label='Threshold')
+            plt.title('Similarity Scores')
+            plt.xlabel('Instance')
+            plt.ylabel('Score')
+            plt.legend()
+        
+        # Plot accuracy
+        plt.subplot(1, 2, 2)
+        if self.accuracy_history:
+            plt.plot(self.accuracy_history, label='Accuracy')
+            plt.title('Model Accuracy')
+            plt.xlabel('Evaluation Step')
+            plt.ylabel('Accuracy')
+            plt.legend()
+        
+        plt.tight_layout()
+        plt.show()
 #    def forward_few_shot(self, support, query, label, B, N, K, Q):
 #        for b in range(B):
 #            for n in range(N):
@@ -720,6 +749,7 @@ class Snowball(nrekit.framework.Model):
         self._prec = precision
         self._recall = recall
         self._f1 = f1
+        self.accuracy_history.append(accuracy)  # Store accuracy
         return (accuracy, precision, recall, f1, auc)
 
     def forward(self, support_pos, query, distant, pos_class, threshold=0.5, threshold_for_snowball=0.5):
@@ -736,6 +766,32 @@ class Snowball(nrekit.framework.Model):
         self.pos_class = pos_class 
 
         self._forward_train(support_pos, query, distant, threshold=threshold)
+        self.plot_metrics()  # Call to plot metrics after training
+
+    def plot_metrics(self):
+        plt.figure(figsize=(12, 5))
+        
+        # Plot similarity scores
+        plt.subplot(1, 2, 1)
+        if self.similarity_scores:
+            plt.plot(self.similarity_scores, label='Similarity')
+            plt.axhline(y=0.5, color='r', linestyle='--', label='Threshold')
+            plt.title('Similarity Scores')
+            plt.xlabel('Instance')
+            plt.ylabel('Score')
+            plt.legend()
+        
+        # Plot accuracy
+        plt.subplot(1, 2, 2)
+        if self.accuracy_history:
+            plt.plot(self.accuracy_history, label='Accuracy')
+            plt.title('Model Accuracy')
+            plt.xlabel('Evaluation Step')
+            plt.ylabel('Accuracy')
+            plt.legend()
+        
+        plt.tight_layout()
+        plt.show()
 
     def init_10shot(self, Ws, bs):
         self.Ws = torch.stack(Ws, 0).transpose(0, 1) # (230, 16)
