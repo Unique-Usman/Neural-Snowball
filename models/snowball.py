@@ -7,38 +7,33 @@ import torch
 from torch import autograd, optim, nn
 from torch.autograd import Variable
 from torch.nn import functional as F
-import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, GATConv
+
 import sklearn.metrics 
 import copy
 
-class WeightedGNN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, use_attention=True):
-        super(WeightedGNN, self).__init__()
-        self.use_attention = use_attention
+# Add this class at the beginning of snowball.py after imports
+class TopKSentenceManager:
+    def __init__(self, k=5):
+        self.k = k
+        self.entpair_sentences = {}  # Maps entpair to list of (sentence_rep, score)
         
-        if use_attention:
-            self.conv1 = GATConv(input_dim, hidden_dim, heads=8, dropout=0.5)
-            self.conv2 = GATConv(hidden_dim * 8, output_dim, heads=1, concat=False, dropout=0.5)
-        else:
-            self.conv1 = GCNConv(input_dim, hidden_dim)
-            self.conv2 = GCNConv(hidden_dim, output_dim)
+    def update(self, entpair, sentence_rep, score):
+        if entpair not in self.entpair_sentences:
+            self.entpair_sentences[entpair] = []
+            
+        # Add new sentence
+        self.entpair_sentences[entpair].append((sentence_rep, score))
+        # Sort by score and keep top k
+        self.entpair_sentences[entpair].sort(key=lambda x: x[1], reverse=True)
+        self.entpair_sentences[entpair] = self.entpair_sentences[entpair][:self.k]
         
-        self.dropout = nn.Dropout(0.5)
+    def get_averaged_representation(self, entpair):
+        if entpair not in self.entpair_sentences or not self.entpair_sentences[entpair]:
+            return None
         
-    def forward(self, x, edge_index, edge_weight=None):
-        # Normalize edge weights (ADDED)
-        if edge_weight is not None:
-            edge_weight = edge_weight / edge_weight.sum()  # Normalize
-        
-        if self.use_attention:
-            x = F.elu(self.conv1(x, edge_index))
-        else:
-            x = F.relu(self.conv1(x, edge_index, edge_weight))
-        x = self.dropout(x)
-        x = self.conv2(x, edge_index, edge_weight)
-        return x
-    
+        # Average the representations of top-k sentences
+        representations = [s[0] for s in self.entpair_sentences[entpair]]
+        return torch.stack(representations).mean(0)
 
 class Siamese(nn.Module):
 
@@ -159,6 +154,39 @@ class Siamese(nn.Module):
             pred.append((score[i], i))
         pred.sort(key=lambda x: x[0], reverse=True)
         return pred
+    #################ADDED TO SIAMESE CLASS#################
+    def forward_infer_sort_topk(self, support_data, candidate_data, topk_manager, batch_size=0):
+        """Modified version that uses averaged representations from top-K sentences"""
+        y = self.encode(candidate_data, batch_size=batch_size)
+        
+        # Get averaged representations for each entity pair
+        scores = []
+        for i in range(len(candidate_data['entpair'])):
+            entpair = candidate_data['entpair'][i]
+            avg_rep = topk_manager.get_averaged_representation(entpair)
+            
+            if avg_rep is None:
+                # If no existing representations, use regular comparison
+                x = self.encode(support_data, batch_size=batch_size)
+                x = x.unsqueeze(1)
+                curr_y = y[i].unsqueeze(0).unsqueeze(0)
+            else:
+                # Use averaged representation
+                x = avg_rep.unsqueeze(0).unsqueeze(1)
+                curr_y = y[i].unsqueeze(0).unsqueeze(0)
+                
+            if self.euc:
+                dis = torch.pow(x - curr_y, 2)
+                score = torch.sigmoid(self.fc(dis).squeeze(-1)).mean(0)
+            else:
+                z = x * curr_y
+                z = self.fc(z).squeeze(-1)
+                score = torch.sigmoid(z).mean(0)
+                
+            scores.append((score.item(), i))
+        
+        scores.sort(key=lambda x: x[0], reverse=True)
+        return scores
 
 class Snowball(nrekit.framework.Model):
     
@@ -166,42 +194,19 @@ class Snowball(nrekit.framework.Model):
         nrekit.framework.Model.__init__(self, sentence_encoder)
         self.hidden_size = hidden_size
         self.base_class = base_class
+        self.fc = nn.Linear(hidden_size, base_class)
+        self.drop = nn.Dropout(drop_rate)
         self.siamese_model = siamese_model
+        # self.cost = nn.BCEWithLogitsLoss()
+        self.cost = nn.BCELoss(reduction="none")
+        # self.cost = nn.CrossEntropyLoss()
         self.weight_table = weight_table
+        
         self.args = args
+
         self.pre_rep = pre_rep
         self.neg_loader = neg_loader
-
-        # Initialize GNN
-        self.gnn = WeightedGNN(input_dim=hidden_size, hidden_dim=hidden_size//2, output_dim=hidden_size)
-        
-        # Modified for combined RSN and GNN features
-        self.fc = nn.Linear(hidden_size, base_class)  # Changed from hidden_size*2 to hidden_size
-        self.drop = nn.Dropout(drop_rate)
-        self.cost = nn.BCELoss(reduction="none")
-         
-    def _construct_graph(self, support_pos_rep, pick_or_not, batch_size):
-        """Constructs graph from similarity scores"""
-        num_nodes = support_pos_rep.size(0)
-        edge_index = []
-        edge_weights = []
-        
-        for score, idx in pick_or_not:
-            if score > 0.5:  # Confidence threshold
-                edge_index.append([idx // batch_size, idx % batch_size])
-                edge_weights.append(score)
-        
-        if len(edge_index) == 0:
-            return None, None
-            
-        edge_index = torch.tensor(edge_index).t().contiguous().cuda()
-        edge_weights = torch.tensor(edge_weights).cuda()
-        
-        return edge_index, edge_weights
-                
-        ##############END##########################################################
-
-        
+        self.topk_manager = TopKSentenceManager(k=5)  # Add this line
 
     # def __loss__(self, logits, label):
     #     onehot_label = torch.zeros(logits.size()).cuda()
@@ -223,9 +228,10 @@ class Snowball(nrekit.framework.Model):
         else:
             weight = self.weight_table[data['label']].unsqueeze(1).expand(-1, self.base_class).contiguous().view(-1)
         label = torch.zeros((batch_size, self.base_class)).cuda()
-        label.scatter_(1, data['label'].view(-1, 1), 1)
+        label.scatter_(1, data['label'].view(-1, 1), 1) # (batch_size, base_class)
         loss_array = self.__loss__(x, label)
         self._loss = ((label.view(-1) + 1.0 / self.base_class) * weight * loss_array).mean() * self.base_class
+        # self._loss = self.__loss__(x, data['label'])
         
         _, pred = x.max(-1)
         self._accuracy = self.__accuracy__(pred, data['label'])
@@ -326,72 +332,63 @@ class Snowball(nrekit.framework.Model):
         self.new_W = self.new_W.cuda()
         self.new_bias = self.new_bias.cuda()
 
-    def _train_finetune(self, data_repre, edge_index=None, edge_weights=None, learning_rate=None, weight_decay=1e-5):
+    def _train_finetune(self, data_repre, learning_rate=None, weight_decay=1e-5):
         '''
         train finetune classifier with given data
-        data_repre: sentence representation (encoder's output) 
-        edge_index: graph connectivity
-        edge_weights: edge weights from similarity scores
+        data_repre: sentence representation (encoder's output)
+        label: label
         '''
+        
         self.train()
 
         optimizer = self.optimizer
         if learning_rate is not None:
             optimizer = optim.Adam([self.new_W, self.new_bias], learning_rate, weight_decay=weight_decay)
 
-        # Apply GNN if graph structure exists
-        if edge_index is not None and edge_weights is not None:
-            gnn_features = self.gnn(data_repre, edge_index, edge_weights)
-            # Combine original and GNN features through addition
-            enhanced_rep = data_repre + gnn_features
-        else:
-            enhanced_rep = data_repre
-
-        # Hyperparameters
+        # hyperparameters
         max_epoch = self.args.finetune_epoch
         batch_size = self.args.finetune_batch_size
         
+        # dropout
+        data_repre = self.drop(data_repre) 
+        
+        # train
+        if self.args.print_debug:
+            print('')
         for epoch in range(max_epoch):
-            max_iter = enhanced_rep.size(0) // batch_size
-            if enhanced_rep.size(0) % batch_size != 0:
+            max_iter = data_repre.size(0) // batch_size
+            if data_repre.size(0) % batch_size != 0:
                 max_iter += 1
-            order = list(range(enhanced_rep.size(0)))
+            order = list(range(data_repre.size(0)))
             random.shuffle(order)
-            
-            for i in range(max_iter):
-                x = enhanced_rep[order[i * batch_size : min((i + 1) * batch_size, enhanced_rep.size(0))]]
+            for i in range(max_iter):            
+                x = data_repre[order[i * batch_size : min((i + 1) * batch_size, data_repre.size(0))]]
+                # batch_label = label[order[i * batch_size : min((i + 1) * batch_size, data_repre.size(0))]]
                 
-                # Negative sampling
+                # neg sampling
+                # ---------------------
                 batch_label = torch.ones((x.size(0))).long().cuda()
                 neg_size = int(x.size(0) * 1)
                 neg = self.neg_loader.next_batch(neg_size)
                 neg = self.encode(neg, self.args.infer_batch_size)
-                
-                print("Shape of x after sentence encoder:", x.shape)
-
-                # Apply GNN to negative samples if graph exists
-                if edge_index is not None and edge_weights is not None:
-                    neg_gnn = self.gnn(neg, edge_index, edge_weights)
-                    neg = neg + neg_gnn
-
                 x = torch.cat([x, neg], 0)
                 batch_label = torch.cat([batch_label, torch.zeros((neg_size)).long().cuda()], 0)
+                # ---------------------
 
-                x = torch.matmul(x, self.new_W) + self.new_bias
+                x = torch.matmul(x, self.new_W) + self.new_bias # (batch_size, 1)
                 x = torch.sigmoid(x)
-                
+
+                # iter_loss = self.__loss__(x, batch_label.float()).mean()
                 weight = torch.ones(batch_label.size(0)).float().cuda()
-                weight[batch_label == 0] = self.args.finetune_weight
+                weight[batch_label == 0] = self.args.finetune_weight #1 / float(max_epoch)
                 iter_loss = (self.__loss__(x, batch_label.float()) * weight).mean()
 
                 optimizer.zero_grad()
                 iter_loss.backward(retain_graph=True)
                 optimizer.step()
-                
                 if self.args.print_debug:
                     sys.stdout.write('[snowball finetune] epoch {0:4} iter {1:4} | loss: {2:2.6f}'.format(epoch, i, iter_loss) + '\r')
                     sys.stdout.flush()
-        
         self.eval()
 
     def _add_ins_to_data(self, dataset_dst, dataset_src, ins_id, label=None):
@@ -526,10 +523,6 @@ class Snowball(nrekit.framework.Model):
         exist_id = {}
         if self.args.print_debug:
             print('\n-------------------------------------------------------')
-        
-        
-        
-        
         for snowball_iter in range(snowball_max_iter):
             if self.args.print_debug:
                 print('###### snowball iter ' + str(snowball_iter))
@@ -569,28 +562,70 @@ class Snowball(nrekit.framework.Model):
                     continue
 
                 
-                pick_or_not = self.siamese_model.forward_infer_sort(entpair_support[entpair], entpair_distant[entpair], batch_size=self.args.infer_batch_size)
-                
+                #pick_or_not = self.siamese_model.forward_infer_sort(entpair_support[entpair], entpair_distant[entpair], batch_size=self.args.infer_batch_size)
+                pick_or_not = self.siamese_model.forward_infer_sort_topk(
+                    entpair_support[entpair], 
+                    entpair_distant[entpair],
+                    self.topk_manager,
+                    batch_size=self.args.infer_batch_size
+                )
                 # pick_or_not = self.siamese_model.forward_infer_sort(original_support_pos, entpair_distant[entpair], threshold=threshold_for_phase1)
                 # pick_or_not = self._infer(entpair_distant[entpair]) > threshold
-                
-                #################ADDED FOR GNN
-                # Construct graph from similarity scores
-                edge_index, edge_weights = self._construct_graph(
-                    support_pos_rep,
-                    pick_or_not,
-                    self.args.infer_batch_size
-            )####################################
-
+      
                 # -- method B: use sort --
                 for i in range(min(len(pick_or_not), sort_num1)):
                     if pick_or_not[i][0] > sort_threshold1:
                         iid = pick_or_not[i][1]
+                        # Update topk manager with new sentence
+                        sentence_rep = self.encode(entpair_distant[entpair], batch_size=self.args.infer_batch_size)[iid]
+                        self.topk_manager.update(
+                            entpair_distant[entpair]['entpair'][iid],
+                            sentence_rep,
+                            pick_or_not[i][0]
+                        )
                         self._add_ins_to_vdata(support_pos, entpair_distant[entpair], iid, label=1)
                         exist_id[entpair_distant[entpair]['id'][iid]] = 1
                         self._phase1_add_num += 1
                 self._phase1_total += entpair_distant[entpair]['word'].size(0)
+            '''
+            if 'pos1' in support_pos:
+                candidate = {'word': [], 'pos1': [], 'pos2': [], 'mask': [], 'id': [], 'entpair': []}
+            else:
+                candidate = {'word': [], 'mask': [], 'id': [], 'entpair': []}
+
+            self._phase1_add_num = 0 # total number of snowball instances
+            self._phase1_total = 0
+            for entpair in entpair_support:
+                raw = distant.get_same_entpair_ins(entpair) # ins with the same entpair
+                if raw is None:
+                    continue
+                for i in range(raw['word'].size(0)):
+                    if raw['id'][i] not in exist_id: # don't pick sentences already in the support set
+                        self._add_ins_to_data(candidate, raw, i)
+
+            if len(candidate['word']) > 0:
+                self._dataset_stack_and_cuda(candidate)
+                pick_or_not = self.siamese_model.forward_infer_sort(support_pos, candidate, batch_size=self.args.infer_batch_size)
+                    
+                for i in range(min(len(pick_or_not), sort_num1)):
+                    if pick_or_not[i][0] > sort_threshold1:
+                        iid = pick_or_not[i][1]
+                        self._add_ins_to_vdata(support_pos, candidate, iid, label=1)
+                        exist_id[candidate['id'][iid]] = 1
+                        self._phase1_add_num += 1
+                self._phase1_total += candidate['word'].size(0)
+            '''
+            ## build new support set
             
+            # print('---')
+            # for i in range(len(support_pos['entpair'])):
+            #     print(support_pos['entpair'][i])
+            # print('---')
+            # print('---')
+            # for i in range(support_pos['id'].size(0)):
+            #     print(support_pos['id'][i])
+            # print('---')
+
             support_pos_rep = self.encode(support_pos, batch_size=self.args.infer_batch_size)
             # support_rep = torch.cat([support_pos_rep, support_neg_rep], 0)
             # support_label = torch.cat([support_pos['label'], support_neg['label']], 0)
@@ -598,11 +633,7 @@ class Snowball(nrekit.framework.Model):
             ## finetune
             # print("Fine-tune Init")
             self._train_finetune_init()
-            #################################ADDED
-            self._train_finetune(support_pos_rep, edge_index, edge_weights)
-            #################################
-
-
+            self._train_finetune(support_pos_rep)
             if self.args.eval:
                 self._forward_eval_binary(query, threshold)
             # self._metric.append(np.array([self._f1, self._prec, self._recall]))
@@ -647,8 +678,7 @@ class Snowball(nrekit.framework.Model):
             ## finetune
             # print("Fine-tune Init")
             self._train_finetune_init()
-            self._train_finetune(support_pos_rep, edge_index, edge_weights)
-    
+            self._train_finetune(support_pos_rep)
             if self.args.eval:
                 self._forward_eval_binary(query, threshold)
                 self._metric.append(np.array([self._f1, self._prec, self._recall]))
