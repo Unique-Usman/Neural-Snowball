@@ -7,34 +7,60 @@ import torch
 from torch import autograd, optim, nn
 from torch.autograd import Variable
 from torch.nn import functional as F
-import matplotlib.pyplot as plt  # Add this import
-
 import sklearn.metrics 
 import copy
 
-# Add this class at the beginning of snowball.py after imports
-class TopKSentenceManager:
-    def __init__(self, k=5):
-        self.k = k
-        self.entpair_sentences = {}  # Maps entpair to list of (sentence_rep, score)
-        
-    def update(self, entpair, sentence_rep, score):
-        if entpair not in self.entpair_sentences:
-            self.entpair_sentences[entpair] = []
-            
-        # Add new sentence
-        self.entpair_sentences[entpair].append((sentence_rep, score))
-        # Sort by score and keep top k
-        self.entpair_sentences[entpair].sort(key=lambda x: x[1], reverse=True)
-        self.entpair_sentences[entpair] = self.entpair_sentences[entpair][:self.k]
-        
-    def get_averaged_representation(self, entpair):
-        if entpair not in self.entpair_sentences or not self.entpair_sentences[entpair]:
-            return None
-        
-        # Average the representations of top-k sentences
-        representations = [s[0] for s in self.entpair_sentences[entpair]]
-        return torch.stack(representations).mean(0)
+import matplotlib.pyplot as plt
+import networkx as nx
+from torch_geometric.utils import to_networkx
+
+
+
+class EnhancedGNN(nn.Module):
+    """
+    Graph Neural Network for refining RSN-based node features.
+    """
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2, use_attention=True):
+        super(EnhancedGNN, self).__init__()
+        self.layers = nn.ModuleList()
+        self.num_layers = num_layers
+        self.use_attention = use_attention
+
+        # Add GNN layers (GCN or GAT)
+        for i in range(num_layers):
+            if use_attention:
+                layer = GATConv(
+                    input_dim if i == 0 else hidden_dim,
+                    hidden_dim if i < num_layers - 1 else output_dim,
+                    heads=1 if i == num_layers - 1 else 8,
+                    concat=(i < num_layers - 1),
+                    dropout=0.5,
+                )
+            else:
+                layer = GCNConv(
+                    input_dim if i == 0 else hidden_dim,
+                    hidden_dim if i < num_layers - 1 else output_dim,
+                )
+            self.layers.append(layer)
+
+        self.dropout = nn.Dropout(0.5)
+
+    def forward(self, x, edge_index, edge_weight=None):
+        """
+        Forward pass through GNN layers.
+        :param x: Node features.
+        :param edge_index: Edge connections.
+        :param edge_weight: Edge weights for GCN (optional).
+        """
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, GCNConv):  # GCN
+                x = F.relu(layer(x, edge_index, edge_weight))
+            else:  # GAT
+                x = F.elu(layer(x, edge_index))
+            if i < self.num_layers - 1:  # Apply dropout between layers
+                x = self.dropout(x)
+        return x
+
 
 class Siamese(nn.Module):
 
@@ -155,39 +181,6 @@ class Siamese(nn.Module):
             pred.append((score[i], i))
         pred.sort(key=lambda x: x[0], reverse=True)
         return pred
-    #################ADDED TO SIAMESE CLASS#################
-    def forward_infer_sort_topk(self, support_data, candidate_data, topk_manager, batch_size=0):
-        """Modified version that uses averaged representations from top-K sentences"""
-        y = self.encode(candidate_data, batch_size=batch_size)
-        
-        # Get averaged representations for each entity pair
-        scores = []
-        for i in range(len(candidate_data['entpair'])):
-            entpair = candidate_data['entpair'][i]
-            avg_rep = topk_manager.get_averaged_representation(entpair)
-            
-            if avg_rep is None:
-                # If no existing representations, use regular comparison
-                x = self.encode(support_data, batch_size=batch_size)
-                x = x.unsqueeze(1)
-                curr_y = y[i].unsqueeze(0).unsqueeze(0)
-            else:
-                # Use averaged representation
-                x = avg_rep.unsqueeze(0).unsqueeze(1)
-                curr_y = y[i].unsqueeze(0).unsqueeze(0)
-                
-            if self.euc:
-                dis = torch.pow(x - curr_y, 2)
-                score = torch.sigmoid(self.fc(dis).squeeze(-1)).mean(0)
-            else:
-                z = x * curr_y
-                z = self.fc(z).squeeze(-1)
-                score = torch.sigmoid(z).mean(0)
-                
-            scores.append((score.item(), i))
-        
-        scores.sort(key=lambda x: x[0], reverse=True)
-        return scores
 
 class Snowball(nrekit.framework.Model):
     
@@ -207,12 +200,10 @@ class Snowball(nrekit.framework.Model):
 
         self.pre_rep = pre_rep
         self.neg_loader = neg_loader
-        self.topk_manager = TopKSentenceManager(k=5)  # Add this line
 
         # Initialize lists to store metrics
-        self.similarity_scores = []  # Store similarity scores
-        self.accuracy_history = []    # Store accuracy history
-
+        self.similarity_scores = []  # Initialize similarity scores list
+        self.accuracy_history = []    # Initialize accuracy history list
 
     # def __loss__(self, logits, label):
     #     onehot_label = torch.zeros(logits.size()).cuda()
@@ -221,27 +212,51 @@ class Snowball(nrekit.framework.Model):
 
     # def __loss__(self, logits, label):
     #     return self.cost(logits, label)
+    
+    def construct_graph(self, node_features, similarity_scores, threshold=0.5):
+        """
+        Constructs a graph using similarity scores as edge weights.
+        :param node_features: RSN sentence embeddings (node features).
+        :param similarity_scores: List of (score, idx) from RSN.
+        :param threshold: Minimum similarity score to form an edge.
+        :return: edge_index, edge_weight.
+        """
+        edge_index, edge_weights = [], []
+        for score, (i, j) in similarity_scores:
+            if score > threshold:
+                edge_index.append([i, j])
+                edge_index.append([j, i])  # Bidirectional edges
+                edge_weights.append(score)
+                edge_weights.append(score)
+
+        if edge_index:
+            edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous().cuda()
+            edge_weights = torch.tensor(edge_weights, dtype=torch.float).cuda()
+        else:
+            edge_index, edge_weights = None, None
+
+        return edge_index, edge_weights
 
     def forward_base(self, data):
-        batch_size = data['word'].size(0)
-        x = self.sentence_encoder(data) # (batch_size, hidden_size)
-        x = self.drop(x)
-        x = self.fc(x) # (batch_size, base_class)
+            batch_size = data['word'].size(0)
+            x = self.sentence_encoder(data) # (batch_size, hidden_size)
+            x = self.drop(x)
+            x = self.fc(x) # (batch_size, base_class)
 
-        x = torch.sigmoid(x)
-        if self.weight_table is None:
-            weight = 1.0
-        else:
-            weight = self.weight_table[data['label']].unsqueeze(1).expand(-1, self.base_class).contiguous().view(-1)
-        label = torch.zeros((batch_size, self.base_class)).cuda()
-        label.scatter_(1, data['label'].view(-1, 1), 1) # (batch_size, base_class)
-        loss_array = self.__loss__(x, label)
-        self._loss = ((label.view(-1) + 1.0 / self.base_class) * weight * loss_array).mean() * self.base_class
-        # self._loss = self.__loss__(x, data['label'])
-        
-        _, pred = x.max(-1)
-        self._accuracy = self.__accuracy__(pred, data['label'])
-        self._pred = pred
+            x = torch.sigmoid(x)
+            if self.weight_table is None:
+                weight = 1.0
+            else:
+                weight = self.weight_table[data['label']].unsqueeze(1).expand(-1, self.base_class).contiguous().view(-1)
+            label = torch.zeros((batch_size, self.base_class)).cuda()
+            label.scatter_(1, data['label'].view(-1, 1), 1) # (batch_size, base_class)
+            loss_array = self.__loss__(x, label)
+            self._loss = ((label.view(-1) + 1.0 / self.base_class) * weight * loss_array).mean() * self.base_class
+            # self._loss = self.__loss__(x, data['label'])
+            
+            _, pred = x.max(-1)
+            self._accuracy = self.__accuracy__(pred, data['label'])
+            self._pred = pred
     
     def forward_baseline(self, support_pos, query, threshold=0.5):
         '''
@@ -302,30 +317,7 @@ class Snowball(nrekit.framework.Model):
         self._accuracy = self.__accuracy__(pred.view(-1), label.view(-1))
 
         return logits, pred
-    def plot_metrics(self):
-        plt.figure(figsize=(12, 5))
-        
-        # Plot similarity scores
-        plt.subplot(1, 2, 1)
-        if self.similarity_scores:
-            plt.plot(self.similarity_scores, label='Similarity')
-            plt.axhline(y=0.5, color='r', linestyle='--', label='Threshold')
-            plt.title('Similarity Scores')
-            plt.xlabel('Instance')
-            plt.ylabel('Score')
-            plt.legend()
-        
-        # Plot accuracy
-        plt.subplot(1, 2, 2)
-        if self.accuracy_history:
-            plt.plot(self.accuracy_history, label='Accuracy')
-            plt.title('Model Accuracy')
-            plt.xlabel('Evaluation Step')
-            plt.ylabel('Accuracy')
-            plt.legend()
-        
-        plt.tight_layout()
-        plt.show()
+
 #    def forward_few_shot(self, support, query, label, B, N, K, Q):
 #        for b in range(B):
 #            for n in range(N):
@@ -360,65 +352,114 @@ class Snowball(nrekit.framework.Model):
         self.optimizer = optim.Adam([self.new_W, self.new_bias], self.args.finetune_lr, weight_decay=self.args.finetune_wd)
         self.new_W = self.new_W.cuda()
         self.new_bias = self.new_bias.cuda()
-
-    def _train_finetune(self, data_repre, learning_rate=None, weight_decay=1e-5):
-        '''
-        train finetune classifier with given data
-        data_repre: sentence representation (encoder's output)
-        label: label
-        '''
-        
+    
+    def _train_finetune(self, data_repre, learning_rate=None, labels=None, edge_index=None, edge_weights=None, num_epochs=10, weight_decay=1e-5):
+        """
+        Fine-tune classifier with GNN integration while retaining original logic.
+        :param data_repre: Sentence representation (encoder's output).
+        :param labels: Ground-truth labels.
+        :param edge_index: Graph connectivity.
+        :param edge_weights: Edge weights from similarity scores.
+        :param learning_rate: Optional learning rate for optimizer.
+        :param num_epochs: Number of epochs for fine-tuning.
+        :param weight_decay: Weight decay for optimizer.
+        """
         self.train()
 
+        # Optimizer setup
         optimizer = self.optimizer
         if learning_rate is not None:
             optimizer = optim.Adam([self.new_W, self.new_bias], learning_rate, weight_decay=weight_decay)
 
-        # hyperparameters
-        max_epoch = self.args.finetune_epoch
+        # Hyperparameters
+        max_epoch = num_epochs
         batch_size = self.args.finetune_batch_size
-        
-        # dropout
-        data_repre = self.drop(data_repre) 
-        
-        # train
+
+        # Apply dropout to the data representation
+        data_repre = self.drop(data_repre)
+
+        # Debugging and logging
         if self.args.print_debug:
             print('')
+        
+        loss_history = []  # To track loss for plotting
+
+        # Training loop
         for epoch in range(max_epoch):
             max_iter = data_repre.size(0) // batch_size
             if data_repre.size(0) % batch_size != 0:
                 max_iter += 1
             order = list(range(data_repre.size(0)))
             random.shuffle(order)
-            for i in range(max_iter):            
-                x = data_repre[order[i * batch_size : min((i + 1) * batch_size, data_repre.size(0))]]
-                # batch_label = label[order[i * batch_size : min((i + 1) * batch_size, data_repre.size(0))]]
-                
-                # neg sampling
-                # ---------------------
+
+            for i in range(max_iter):
+                # Batch preparation
+                x = data_repre[order[i * batch_size: min((i + 1) * batch_size, data_repre.size(0))]]
                 batch_label = torch.ones((x.size(0))).long().cuda()
+
+                # Negative sampling
                 neg_size = int(x.size(0) * 1)
                 neg = self.neg_loader.next_batch(neg_size)
                 neg = self.encode(neg, self.args.infer_batch_size)
+
+                # Apply GNN to negative samples if graph exists
+                if edge_index is not None and edge_weights is not None:
+                    neg_enhanced = self.gnn(neg, edge_index, edge_weights)
+                    neg = torch.cat((neg, neg_enhanced), dim=1)  # Concatenate negative features
+
+                # Combine positive and negative samples
                 x = torch.cat([x, neg], 0)
                 batch_label = torch.cat([batch_label, torch.zeros((neg_size)).long().cuda()], 0)
-                # ---------------------
 
-                x = torch.matmul(x, self.new_W) + self.new_bias # (batch_size, 1)
+                # Apply GNN to positive samples if graph exists
+                if edge_index is not None and edge_weights is not None:
+                    gnn_enhanced_rep = self.gnn(x, edge_index, edge_weights)
+                    x = torch.cat((x, gnn_enhanced_rep), dim=1)  # Concatenate GNN-enhanced features
+
+                # Forward pass
+                x = torch.matmul(x, self.new_W) + self.new_bias  # (batch_size, 1)
                 x = torch.sigmoid(x)
 
-                # iter_loss = self.__loss__(x, batch_label.float()).mean()
+                # Compute loss with weighted negative samples
                 weight = torch.ones(batch_label.size(0)).float().cuda()
-                weight[batch_label == 0] = self.args.finetune_weight #1 / float(max_epoch)
+                weight[batch_label == 0] = self.args.finetune_weight
                 iter_loss = (self.__loss__(x, batch_label.float()) * weight).mean()
 
+                # Optimization
                 optimizer.zero_grad()
                 iter_loss.backward(retain_graph=True)
                 optimizer.step()
+                
+                 # Calculate accuracy
+                accuracy = (x.round() == batch_label.float()).float().mean().item()
+                self.accuracy_history.append(accuracy)  # Log accuracy
+
+
+                # Logging for debugging
                 if self.args.print_debug:
                     sys.stdout.write('[snowball finetune] epoch {0:4} iter {1:4} | loss: {2:2.6f}'.format(epoch, i, iter_loss) + '\r')
                     sys.stdout.flush()
+
+                # Append loss for visualization
+                loss_history.append(iter_loss.item())
+
         self.eval()
+
+        # Plot loss history for presentation
+        self.plot_loss_history(loss_history)
+
+    def plot_loss_history(self, loss_history):
+        """
+        Plot loss history for fine-tuning.
+        :param loss_history: List of loss values over training iterations.
+        """
+        plt.figure(figsize=(8, 6))
+        plt.plot(loss_history, label="Loss", color="red")
+        plt.xlabel("Iteration")
+        plt.ylabel("Loss")
+        plt.title("Loss Curve During Fine-Tuning")
+        plt.legend()
+        plt.show()
 
     def _add_ins_to_data(self, dataset_dst, dataset_src, ins_id, label=None):
         '''
@@ -510,72 +551,62 @@ class Snowball(nrekit.framework.Model):
         return x.view(-1)
 
     def _forward_train(self, support_pos, query, distant, threshold=0.5):
-        '''
-        snowball process (train)
-        support_pos: support set (positive, raw data)
-        support_neg: support set (negative, raw data)
-        query: query set
-        distant: distant data loader
-        threshold: ins with prob > threshold will be classified as positive
-        threshold_for_phase1: distant ins with prob > th_for_phase1 will be added to extended support set at phase1
-        threshold_for_phase2: distant ins with prob > th_for_phase2 will be added to extended support set at phase2
-        '''
-
-        # hyperparameters
+        """
+        Snowball training process with GNN integration and graphical logging.
+        :param support_pos: Positive support set (raw data).
+        :param query: Query set.
+        :param distant: Distant data loader.
+        :param threshold: Instances with prob > threshold are classified as positive.
+        """
+        # Hyperparameters
         snowball_max_iter = self.args.snowball_max_iter
-        sys.stdout.flush()
         candidate_num_class = 20
         candidate_num_ins_per_class = 100
-        
+
         sort_num1 = self.args.phase1_add_num
         sort_num2 = self.args.phase2_add_num
         sort_threshold1 = self.args.phase1_siamese_th
         sort_threshold2 = self.args.phase2_siamese_th
         sort_ori_threshold = self.args.phase2_cl_th
 
-        # get neg representations with sentence encoder
-        # support_neg_rep = self.encode(support_neg, batch_size=self.args.infer_batch_size)
-        
-        # init
+        # Initialize support set representation
         self._train_finetune_init()
-        # support_rep = self.encode(support, self.args.infer_batch_size)
         support_pos_rep = self.encode(support_pos, self.args.infer_batch_size)
-        # self._train_finetune(support_rep, support['label'])
-        self._train_finetune(support_pos_rep)
+        self._train_finetune(support_pos_rep)  # Initial fine-tuning
 
+        # Log initial embeddings
+        self.plot_embeddings(support_pos_rep, support_pos['label'], title="Initial Embeddings")
+
+        # Keep metrics for visualization
         self._metric = []
 
-        # copy
-        original_support_pos = copy.deepcopy(support_pos)
+        # Tracking existing IDs
+        exist_id = {support_pos['id'][i]: 1 for i in range(len(support_pos['id']))}
 
-        # snowball
-        exist_id = {}
-        if self.args.print_debug:
-            print('\n-------------------------------------------------------')
+        # Begin Snowball iterations
         for snowball_iter in range(snowball_max_iter):
-            if self.args.print_debug:
-                print('###### snowball iter ' + str(snowball_iter))
-            # phase 1: expand positive support set from distant dataset (with same entity pairs)
+            print(f"=== Snowball Iteration {snowball_iter + 1}/{snowball_max_iter} ===")
 
-            ## get all entpairs and their ins in positive support set
-            old_support_pos_label = support_pos['label'] + 0
+            # Phase 1: Expand positive support set from distant dataset
+            self._phase1_add_num = 0
+            self._phase1_total = 0
+
             entpair_support = {}
             entpair_distant = {}
-            for i in range(len(support_pos['id'])): # only positive support
+
+            # Group support instances by entity pairs
+            for i in range(len(support_pos['id'])):
                 entpair = support_pos['entpair'][i]
-                exist_id[support_pos['id'][i]] = 1
                 if entpair not in entpair_support:
                     if 'pos1' in support_pos:
                         entpair_support[entpair] = {'word': [], 'pos1': [], 'pos2': [], 'mask': [], 'id': []}
                     else:
                         entpair_support[entpair] = {'word': [], 'mask': [], 'id': []}
                 self._add_ins_to_data(entpair_support[entpair], support_pos, i)
-            
-            ## pick all ins with the same entpairs in distant data and choose with siamese network
-            self._phase1_add_num = 0 # total number of snowball instances
-            self._phase1_total = 0
+
+            # Process distant instances with the same entity pairs
             for entpair in entpair_support:
-                raw = distant.get_same_entpair_ins(entpair) # ins with the same entpair
+                raw = distant.get_same_entpair_ins(entpair)
                 if raw is None:
                     continue
                 if 'pos1' in support_pos:
@@ -583,142 +614,86 @@ class Snowball(nrekit.framework.Model):
                 else:
                     entpair_distant[entpair] = {'word': [], 'mask': [], 'id': [], 'entpair': []}
                 for i in range(raw['word'].size(0)):
-                    if raw['id'][i] not in exist_id: # don't pick sentences already in the support set
+                    if raw['id'][i] not in exist_id:
                         self._add_ins_to_data(entpair_distant[entpair], raw, i)
+
+                # Convert data to tensors
                 self._dataset_stack_and_cuda(entpair_support[entpair])
                 self._dataset_stack_and_cuda(entpair_distant[entpair])
                 if len(entpair_support[entpair]['word']) == 0 or len(entpair_distant[entpair]['word']) == 0:
                     continue
 
-                
-                #pick_or_not = self.siamese_model.forward_infer_sort(entpair_support[entpair], entpair_distant[entpair], batch_size=self.args.infer_batch_size)
-                pick_or_not = self.siamese_model.forward_infer_sort_topk(
-                    entpair_support[entpair], 
-                    entpair_distant[entpair],
-                    self.topk_manager,
-                    batch_size=self.args.infer_batch_size
+                # Use Siamese model to rank instances
+                pick_or_not = self.siamese_model.forward_infer_sort(
+                    entpair_support[entpair], entpair_distant[entpair], batch_size=self.args.infer_batch_size
                 )
-                # pick_or_not = self.siamese_model.forward_infer_sort(original_support_pos, entpair_distant[entpair], threshold=threshold_for_phase1)
-                # pick_or_not = self._infer(entpair_distant[entpair]) > threshold
-      
-                # -- method B: use sort --
+
+                # Construct graph from similarity scores
+                edge_index, edge_weights = self.construct_graph(support_pos_rep, pick_or_not)
+
+                # Visualize graph
+                self.plot_graph(edge_index)
+
+                # Fine-tune with GNN-enhanced features
+                if edge_index is not None:
+                    self._train_finetune(
+                        support_pos_rep, labels=support_pos['label'], edge_index=edge_index, edge_weights=edge_weights
+                    )
+
+                # Expand support set with high-confidence instances
                 for i in range(min(len(pick_or_not), sort_num1)):
                     if pick_or_not[i][0] > sort_threshold1:
                         iid = pick_or_not[i][1]
-                        # Update topk manager with new sentence
-                        sentence_rep = self.encode(entpair_distant[entpair], batch_size=self.args.infer_batch_size)[iid]
-                        self.topk_manager.update(
-                            entpair_distant[entpair]['entpair'][iid],
-                            sentence_rep,
-                            pick_or_not[i][0]
-                        )
                         self._add_ins_to_vdata(support_pos, entpair_distant[entpair], iid, label=1)
                         exist_id[entpair_distant[entpair]['id'][iid]] = 1
                         self._phase1_add_num += 1
                 self._phase1_total += entpair_distant[entpair]['word'].size(0)
-            '''
-            if 'pos1' in support_pos:
-                candidate = {'word': [], 'pos1': [], 'pos2': [], 'mask': [], 'id': [], 'entpair': []}
-            else:
-                candidate = {'word': [], 'mask': [], 'id': [], 'entpair': []}
 
-            self._phase1_add_num = 0 # total number of snowball instances
-            self._phase1_total = 0
-            for entpair in entpair_support:
-                raw = distant.get_same_entpair_ins(entpair) # ins with the same entpair
-                if raw is None:
-                    continue
-                for i in range(raw['word'].size(0)):
-                    if raw['id'][i] not in exist_id: # don't pick sentences already in the support set
-                        self._add_ins_to_data(candidate, raw, i)
+            # Update support set representation
+            support_pos_rep = self.encode(support_pos, self.args.infer_batch_size)
 
-            if len(candidate['word']) > 0:
-                self._dataset_stack_and_cuda(candidate)
-                pick_or_not = self.siamese_model.forward_infer_sort(support_pos, candidate, batch_size=self.args.infer_batch_size)
-                    
-                for i in range(min(len(pick_or_not), sort_num1)):
-                    if pick_or_not[i][0] > sort_threshold1:
-                        iid = pick_or_not[i][1]
-                        self._add_ins_to_vdata(support_pos, candidate, iid, label=1)
-                        exist_id[candidate['id'][iid]] = 1
-                        self._phase1_add_num += 1
-                self._phase1_total += candidate['word'].size(0)
-            '''
-            ## build new support set
-            
-            # print('---')
-            # for i in range(len(support_pos['entpair'])):
-            #     print(support_pos['entpair'][i])
-            # print('---')
-            # print('---')
-            # for i in range(support_pos['id'].size(0)):
-            #     print(support_pos['id'][i])
-            # print('---')
+            # Log embeddings after Phase 1
+            self.plot_embeddings(support_pos_rep, support_pos['label'], title=f"After Phase 1 (Iteration {snowball_iter + 1})")
 
-            support_pos_rep = self.encode(support_pos, batch_size=self.args.infer_batch_size)
-            # support_rep = torch.cat([support_pos_rep, support_neg_rep], 0)
-            # support_label = torch.cat([support_pos['label'], support_neg['label']], 0)
-            
-            ## finetune
-            # print("Fine-tune Init")
-            self._train_finetune_init()
-            self._train_finetune(support_pos_rep)
-            if self.args.eval:
-                self._forward_eval_binary(query, threshold)
-            # self._metric.append(np.array([self._f1, self._prec, self._recall]))
-            if self.args.print_debug:
-                print('\nphase1 add {} ins / {}'.format(self._phase1_add_num, self._phase1_total))
-
-            # phase 2: use the new classifier to pick more extended support ins
+            # Phase 2: Use classifier to expand support set further
             self._phase2_add_num = 0
             candidate = distant.get_random_candidate(self.pos_class, candidate_num_class, candidate_num_ins_per_class)
 
-            ## -- method 1: directly use the classifier --
+            # Infer candidate probabilities
             candidate_prob = self._infer(candidate, batch_size=self.args.infer_batch_size)
-            ## -- method 2: use siamese network --
+            pick_or_not = self.siamese_model.forward_infer_sort(
+                support_pos, candidate, batch_size=self.args.infer_batch_size
+            )
 
-            pick_or_not = self.siamese_model.forward_infer_sort(support_pos, candidate, batch_size=self.args.infer_batch_size)
-
-            ## -- method A: use threshold --
-            '''
-            self._phase2_total = candidate_prob.size(0)
-            for i in range(candidate_prob.size(0)):
-                # if (candidate_prob[i] > threshold_for_phase2) and not (candidate['id'][i] in exist_id):
-                if (pick_or_not[i]) and (candidate_prob[i] > threshold_for_phase2) and not (candidate['id'][i] in exist_id):
-                    exist_id[candidate['id'][i]] = 1 
-                    self._phase2_add_num += 1
-                    self._add_ins_to_vdata(support_pos, candidate, i, label=1)
-            '''
-
-            ## -- method B: use sort --
+            # Add high-confidence instances to support set
             self._phase2_total = candidate['word'].size(0)
             for i in range(min(len(candidate_prob), sort_num2)):
                 iid = pick_or_not[i][1]
-                if (pick_or_not[i][0] > sort_threshold2) and (candidate_prob[iid] > sort_ori_threshold) and not (candidate['id'][iid] in exist_id):
-                    exist_id[candidate['id'][iid]] = 1 
+                if (pick_or_not[i][0] > sort_threshold2) and (candidate_prob[iid] > sort_ori_threshold) and not (
+                    candidate['id'][iid] in exist_id
+                ):
+                    exist_id[candidate['id'][iid]] = 1
                     self._phase2_add_num += 1
                     self._add_ins_to_vdata(support_pos, candidate, iid, label=1)
 
-            ## build new support set
+            # Update support set representation
             support_pos_rep = self.encode(support_pos, self.args.infer_batch_size)
-            # support_rep = torch.cat([support_pos_rep, support_neg_rep], 0)
-            # support_label = torch.cat([support_pos['label'], support_neg['label']], 0)
 
-            ## finetune
-            # print("Fine-tune Init")
+            # Final fine-tuning
             self._train_finetune_init()
             self._train_finetune(support_pos_rep)
+
+            # Logging and evaluation
             if self.args.eval:
                 self._forward_eval_binary(query, threshold)
                 self._metric.append(np.array([self._f1, self._prec, self._recall]))
-                if self.args.print_debug:
-                    print('\nphase2 add {} ins / {}'.format(self._phase2_add_num, self._phase2_total))
+                print(f"Phase 2 added {self._phase2_add_num} instances out of {self._phase2_total}")
 
+        # Final evaluation
         self._forward_eval_binary(query, threshold)
-        if self.args.print_debug:
-            print('\nphase2 add {} ins / {}'.format(self._phase2_add_num, self._phase2_total))
 
         return support_pos_rep
+
 
     def _forward_eval_binary(self, query, threshold=0.5):
         '''
@@ -741,6 +716,11 @@ class Snowball(nrekit.framework.Model):
             f1 = float(2.0 * precision * recall) / float(precision + recall)
         auc = sklearn.metrics.roc_auc_score(label, query_prob)
         if self.args.print_debug:
+            # Calculate accuracy
+            accuracy = float(np.logical_or(np.logical_and(query_prob > threshold, label == 1), np.logical_and(query_prob < threshold, label == 0)).sum()) / float(query_prob.shape[0])
+    
+            # Log accuracy
+            self.accuracy_history.append(accuracy) 
             print('')
             sys.stdout.write('[EVAL] acc: {0:2.2f}%, prec: {1:2.2f}%, rec: {2:2.2f}%, f1: {3:1.3f}, auc: {4:1.3f}'.format(\
                     accuracy * 100, precision * 100, recall * 100, f1, auc) + '\r')
@@ -749,7 +729,6 @@ class Snowball(nrekit.framework.Model):
         self._prec = precision
         self._recall = recall
         self._f1 = f1
-        self.accuracy_history.append(accuracy)  # Store accuracy
         return (accuracy, precision, recall, f1, auc)
 
     def forward(self, support_pos, query, distant, pos_class, threshold=0.5, threshold_for_snowball=0.5):
@@ -764,34 +743,8 @@ class Snowball(nrekit.framework.Model):
         threshold_for_snowball: distant ins with prob > th_for_snowball will be added to extended support set
         '''
         self.pos_class = pos_class 
-
-        self._forward_train(support_pos, query, distant, threshold=threshold)
         self.plot_metrics()  # Call to plot metrics after training
-
-    def plot_metrics(self):
-        plt.figure(figsize=(12, 5))
-        
-        # Plot similarity scores
-        plt.subplot(1, 2, 1)
-        if self.similarity_scores:
-            plt.plot(self.similarity_scores, label='Similarity')
-            plt.axhline(y=0.5, color='r', linestyle='--', label='Threshold')
-            plt.title('Similarity Scores')
-            plt.xlabel('Instance')
-            plt.ylabel('Score')
-            plt.legend()
-        
-        # Plot accuracy
-        plt.subplot(1, 2, 2)
-        if self.accuracy_history:
-            plt.plot(self.accuracy_history, label='Accuracy')
-            plt.title('Model Accuracy')
-            plt.xlabel('Evaluation Step')
-            plt.ylabel('Accuracy')
-            plt.legend()
-        
-        plt.tight_layout()
-        plt.show()
+        self._forward_train(support_pos, query, distant, threshold=threshold)
 
     def init_10shot(self, Ws, bs):
         self.Ws = torch.stack(Ws, 0).transpose(0, 1) # (230, 16)
